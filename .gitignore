@@ -7,3 +7,10 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 本地数据与运行时文件
+data/
+*.db
+*.db-shm
+*.db-wal
+*.log

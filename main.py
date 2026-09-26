@@ -1,13 +1,14 @@
-import uvicorn
-from fastapi import FastAPI
+"""兼容入口：委托给 app 包的 FastAPI 应用。
 
-app = FastAPI()
+保留 ``python main.py`` 可直接启动；``GET /`` 行为不变。
+"""
 
+from app.main import app, create_app
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app", "create_app"]
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=0)
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)
