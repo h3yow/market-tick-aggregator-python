@@ -32,10 +32,19 @@ class InvalidBatchError(DomainError):
 
 
 class BatchConflictError(DomainError):
-    """相同 batch_id 重放但负载与首次不一致。"""
+    """相同幂等键重放但负载与首次不一致。"""
 
     error_code = "batch_id_conflict"
     http_status = 409
+
+    def __init__(
+        self,
+        message: str,
+        rejected_records: list | None = None,
+        code: str = "batch_id_conflict",
+    ) -> None:
+        super().__init__(message, rejected_records)
+        self.error_code = code
 
 
 class NotFoundError(DomainError):

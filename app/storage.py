@@ -44,7 +44,11 @@ CREATE TABLE IF NOT EXISTS batches (
     accepted      INTEGER NOT NULL,
     rejected      INTEGER NOT NULL,
     rejected_json TEXT NOT NULL,
-    created_at_ms INTEGER NOT NULL
+    created_at_ms INTEGER NOT NULL,
+    kind          TEXT NOT NULL DEFAULT 'ingest',
+    corr_symbol   TEXT,
+    corr_start    INTEGER,
+    corr_end      INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS ticks (
@@ -73,6 +77,14 @@ CREATE TABLE IF NOT EXISTS candles (
 );
 """
 
+# 旧版本数据库（batches 表没有修正元数据列）的增量迁移
+_ADDED_COLUMNS = (
+    ("kind", "TEXT NOT NULL DEFAULT 'ingest'"),
+    ("corr_symbol", "TEXT"),
+    ("corr_start", "INTEGER"),
+    ("corr_end", "INTEGER"),
+)
+
 
 @dataclass(frozen=True)
 class StoredTick:
@@ -93,6 +105,10 @@ class StoredBatch:
     rejected: int
     rejected_records: list[dict]
     created_at_ms: int
+    kind: str = "ingest"
+    corr_symbol: str | None = None
+    corr_start: int | None = None
+    corr_end: int | None = None
 
 
 def window_start_of(ts_ms: int) -> int:
@@ -139,8 +155,21 @@ class TickStore:
     def _create_schema(self) -> None:
         def _ddl() -> None:
             self._conn.executescript(_SCHEMA)
+            self._migrate_columns()
 
         self._exec_with_retry(_ddl)
+
+    def _migrate_columns(self) -> None:
+        """为旧版本数据库补齐新增列（SQLite 无 ``ADD COLUMN IF NOT EXISTS``）。"""
+        existing = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(batches)").fetchall()
+        }
+        for name, decl in _ADDED_COLUMNS:
+            if name not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE batches ADD COLUMN {name} {decl}"
+                )
 
     def _exec_with_retry(self, action, attempts: int = _TX_BUSY_RETRIES):
         """执行单条语句/脚本，遇到 BUSY/LOCKED 做有限退避重试。"""
@@ -183,6 +212,10 @@ class TickStore:
             rejected=row["rejected"],
             rejected_records=json.loads(row["rejected_json"]),
             created_at_ms=row["created_at_ms"],
+            kind=row["kind"],
+            corr_symbol=row["corr_symbol"],
+            corr_start=row["corr_start"],
+            corr_end=row["corr_end"],
         )
 
     # ------------------------------------------------------------------
@@ -272,6 +305,174 @@ class TickStore:
 
         self._run_transaction(_op)
         return affected
+
+    # ------------------------------------------------------------------
+    # 区间整体替换式修正（事务）
+    # ------------------------------------------------------------------
+    def apply_correction(
+        self,
+        correction_id: str,
+        payload_hash: str,
+        symbol: str,
+        start_ms: int,
+        end_ms: int,
+        ticks: list[StoredTick],
+    ) -> dict:
+        """原子完成「区间旧点位删除 + 新点位写入 + 受影响窗口重算」。
+
+        * 删除口径：该标的所有 ``start_ms <= ts < end_ms`` 的旧点位；
+          ``ts == end_ms`` 与区间外点位不动。
+        * 受影响窗口 = 删除前区间内旧点所在窗口 ∪ 新点所在窗口，全部以
+          ticks 事实表全量重算（UPSERT/DELETE），因此窗口内只保留
+          「区间外旧点 + 本次新点」，绝不叠加。
+        * correction_id 复用 ``batches`` 主键，重复提交触发
+          :class:`sqlite3.IntegrityError`，整事务回滚。
+
+        返回 ``{"removed": int, "inserted": int, "affected": set}``。
+        """
+        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+
+        def _op() -> None:
+            self._conn.execute(
+                """
+                INSERT INTO batches(batch_id, payload_hash, received, accepted,
+                                    rejected, rejected_json, created_at_ms,
+                                    kind, corr_symbol, corr_start, corr_end)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'correction', ?, ?, ?)
+                """,
+                (
+                    correction_id,
+                    payload_hash,
+                    len(ticks),
+                    len(ticks),
+                    0,
+                    "[]",
+                    now_ms,
+                    symbol,
+                    start_ms,
+                    end_ms,
+                ),
+            )
+            # 先记录区间内旧点所在窗口（删除后无法再得知），用于后续重算
+            rows = self._conn.execute(
+                "SELECT DISTINCT (ts / ?) AS ws FROM ticks "
+                "WHERE symbol = ? AND ts >= ? AND ts < ?",
+                (WINDOW_MS, symbol, start_ms, end_ms),
+            ).fetchall()
+            affected: set[tuple[str, int]] = {
+                (symbol, int(r["ws"]) * WINDOW_MS) for r in rows
+            }
+            affected.update((t.symbol, window_start_of(t.ts)) for t in ticks)
+
+            cur = self._conn.execute(
+                "DELETE FROM ticks WHERE symbol = ? AND ts >= ? AND ts < ?",
+                (symbol, start_ms, end_ms),
+            )
+            result["removed"] = cur.rowcount
+            self._conn.executemany(
+                """
+                INSERT INTO ticks(batch_id, batch_index, symbol, ts, price, size)
+                VALUES (:batch_id, :batch_index, :symbol, :ts, :price, :size)
+                """,
+                [
+                    {
+                        "batch_id": t.batch_id,
+                        "batch_index": t.batch_index,
+                        "symbol": t.symbol,
+                        "ts": t.ts,
+                        "price": t.price,
+                        "size": t.size,
+                    }
+                    for t in ticks
+                ],
+            )
+            result["inserted"] = len(ticks)
+            result["affected"] = affected
+            self._recompute_windows_locked(sorted(affected))
+
+        result: dict = {"removed": 0, "inserted": 0, "affected": set()}
+        self._run_transaction(_op)
+        return result
+
+    # ------------------------------------------------------------------
+    # 本地对照校验
+    # ------------------------------------------------------------------
+    def verify_symbol(self, symbol: str) -> dict:
+        """以 ticks 事实表重算并与 candles 逐条比对。
+
+        仅读、不开写事务。返回::
+
+            {"checked": int, "mismatches": [
+                {"window_start": int,
+                 "expected": tuple|None,   # ticks 重算结果，None 表示该窗口应不存在
+                 "actual": tuple|None},    # candles 现存结果，None 表示缺失
+            ]}
+
+        ``checked`` 为 ticks 与 candles 两侧窗口并集的数量。
+        """
+        with self._lock:
+            tick_rows = self._exec_with_retry(
+                lambda: self._conn.execute(
+                    "SELECT DISTINCT (ts / ?) AS ws FROM ticks WHERE symbol = ?",
+                    (WINDOW_MS, symbol),
+                ).fetchall()
+            )
+            candle_rows = self._exec_with_retry(
+                lambda: self._conn.execute(
+                    """
+                    SELECT symbol, window_start, open, high, low, close, volume,
+                           tick_count
+                    FROM candles WHERE symbol = ?
+                    """,
+                    (symbol,),
+                ).fetchall()
+            )
+        expected = {
+            int(r["ws"]) * WINDOW_MS
+            for r in tick_rows
+        }
+        actual = {r["window_start"] for r in candle_rows}
+        actual_by_ws = {r["window_start"]: tuple(r) for r in candle_rows}
+
+        mismatches: list[dict] = []
+        for ws in sorted(expected | actual):
+            exp = self._aggregate_window(symbol, ws) if ws in expected else None
+            act = actual_by_ws.get(ws)
+            if not self._candle_equal(exp, act):
+                mismatches.append(
+                    {"window_start": ws, "expected": exp, "actual": act}
+                )
+        return {"checked": len(expected | actual), "mismatches": mismatches}
+
+    @staticmethod
+    def _candle_equal(expected: tuple | None, actual: tuple | None) -> bool:
+        if expected is None or actual is None:
+            return expected is actual
+        # 逐字段比较：成交量/价格用容差，计数用严格相等
+        return (
+            expected[0] == actual[0]
+            and expected[1] == actual[1]
+            and all(
+                abs(float(expected[i]) - float(actual[i])) < 1e-9
+                for i in (2, 3, 4, 5, 6)
+            )
+            and expected[7] == actual[7]
+        )
+
+    def _aggregate_window(self, symbol: str, ws: int) -> tuple:
+        ticks = self._fetch_window_ticks_locked(symbol, ws)
+        first = ticks[0]
+        last = ticks[-1]
+        return (
+            symbol,
+            ws,
+            first.price,
+            max(t.price for t in ticks),
+            min(t.price for t in ticks),
+            last.price,
+            sum(t.size for t in ticks),
+            len(ticks),
+        )
 
     # ------------------------------------------------------------------
     # 聚合 / 重建

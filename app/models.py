@@ -31,6 +31,8 @@ RejectReason = Literal[
     "missing_size",
     "invalid_size",
     "duplicate_tick_in_batch",
+    "symbol_mismatch",
+    "tick_out_of_range",
 ]
 
 # 批次级失败原因码
@@ -44,6 +46,9 @@ BatchErrorCode = Literal[
     "invalid_end",
     "invalid_range",
     "batch_id_conflict",
+    "invalid_correction_id",
+    "records_out_of_range",
+    "correction_id_conflict",
 ]
 
 
@@ -116,6 +121,52 @@ class RebuildRequest(BaseModel):
 class RebuildResponse(BaseModel):
     symbol: str
     rebuilt_windows: int
+
+
+class CorrectionRequest(BaseModel):
+    """按标的与时间区间做整体替换式修正的请求。
+
+    区间口径为 ``[start, end)``（左闭右开，毫秒）：提交后该标的所有
+    ``start <= ts < end`` 的旧点位被整体删除并替换为 ``records``；
+    区间外点位（含 ``ts == end``）不受影响。
+    """
+
+    correction_id: str = Field(..., description="调用方生成的修正幂等键，非空字符串")
+    start: int = Field(..., description="修正区间起点，Unix 毫秒，含", ge=0)
+    end: int = Field(..., description="修正区间终点，Unix 毫秒，不含", ge=0)
+    records: list[dict] = Field(
+        ..., description="修正后的完整点位集合，逐条校验；可为空数组（区间清空）"
+    )
+
+
+class CorrectionResponse(BaseModel):
+    """区间整体替换式修正结果。"""
+
+    correction_id: str
+    symbol: str
+    start: int
+    end: int
+    status: Literal["applied", "duplicate"]
+    removed: int = Field(..., description="本次替换删除的旧点位数（重复提交为 0）")
+    inserted: int = Field(..., description="写入的新点位数（重复提交为首次计数）")
+    affected_windows: list[str] = Field(default_factory=list)
+
+
+class CandleMismatch(BaseModel):
+    """candles 物化结果与 ticks 事实表重算结果不一致的一个窗口。"""
+
+    window_start: int
+    expected: Candle | None = Field(None, description="按 ticks 重算应有的 K 线；None 表示应无此窗口")
+    actual: Candle | None = Field(None, description="candles 表中现存 K 线；None 表示缺失")
+
+
+class VerifyResponse(BaseModel):
+    """以 ticks 事实表为准对 candles 做本地对照校验的结果。"""
+
+    symbol: str
+    consistent: bool
+    checked_windows: int
+    mismatches: list[CandleMismatch]
 
 
 class ErrorBody(BaseModel):
