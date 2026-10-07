@@ -16,9 +16,6 @@ from pydantic import BaseModel, Field
 # 约束常量
 # ---------------------------------------------------------------------------
 
-MAX_BATCH_RECORDS = 10_000
-MAX_SYMBOL_LENGTH = 64
-
 # 行情点校验原因码（无效记录分类）
 RejectReason = Literal[
     "not_an_object",
@@ -31,6 +28,9 @@ RejectReason = Literal[
     "missing_size",
     "invalid_size",
     "duplicate_tick_in_batch",
+    "symbol_mismatch",
+    "tick_outside_range",
+    "duplicate_tick_in_correction",
 ]
 
 # 批次级失败原因码
@@ -44,7 +44,17 @@ BatchErrorCode = Literal[
     "invalid_end",
     "invalid_range",
     "batch_id_conflict",
+    "invalid_correction_id",
+    "invalid_total_parts",
+    "invalid_part_index",
+    "correction_too_large",
+    "correction_conflict",
 ]
+
+MAX_BATCH_RECORDS = 10_000
+MAX_SYMBOL_LENGTH = 64
+# 单次区间修正允许的点位总量上限（所有分片合计）
+MAX_CORRECTION_RECORDS = 100_000
 
 
 class Tick(BaseModel):
@@ -116,6 +126,62 @@ class RebuildRequest(BaseModel):
 class RebuildResponse(BaseModel):
     symbol: str
     rebuilt_windows: int
+
+
+class CorrectionPartRequest(BaseModel):
+    """区间整体替换式修正的一个分片（单批修正即 total_parts=1）。
+
+    时间口径：仅接受 ``start <= ts < end`` 的点位（半开区间，按原始时间戳
+    归属，而非按分钟窗口归属）；``records`` 中每条点位的 ``symbol`` 必须
+    与路径参数 ``symbol`` 完全一致。
+    """
+
+    correction_id: str = Field(..., description="调用方生成的修正幂等键，非空字符串")
+    start: int = Field(..., description="修正区间起点，Unix 毫秒，**含**", ge=0)
+    end: int = Field(..., description="修正区间终点，Unix 毫秒，**不含**", ge=0)
+    total_parts: int = Field(..., description="本次修正共分多少片，正整数", ge=1)
+    part_index: int = Field(..., description="本片序号，从 0 开始且小于 total_parts", ge=0)
+    records: list[dict] = Field(..., description="本片携带的修正点位原始列表（可空）")
+
+
+class CorrectionPartResponse(BaseModel):
+    correction_id: str
+    symbol: str
+    start: int
+    end: int
+    total_parts: int
+    part_index: int
+    status: Literal["pending", "applied", "duplicate"] = Field(
+        ...,
+        description=(
+            "pending=本片已暂存、尚有其它片未到齐；"
+            "applied=本片为最后到齐的一片，修正已整体生效；"
+            "duplicate=该修正此前已生效或本片此前已暂存（幂等返回）"
+        ),
+    )
+    received: int = Field(..., description="本片携带记录数")
+    accepted: int = Field(..., description="本片校验通过的点数")
+    affected_windows: list[str] = Field(
+        default_factory=list,
+        description="修正生效时实际重算的「symbol@分钟窗口」集合（pending/duplicate 为空）",
+    )
+
+
+class CandleMismatch(BaseModel):
+    """K 线物化结果与按当前有效点位重算结果之间的一处差异。"""
+
+    symbol: str
+    window_start: int
+    kind: Literal["missing_candle", "stale_candle", "value_mismatch"]
+    stored: object | None = Field(None, description="candles 表中当前值（缺失时为 null）")
+    expected: object | None = Field(None, description="按有效点位重算的期望值（窗口无有效点位时为 null）")
+
+
+class VerifyResponse(BaseModel):
+    symbol: str
+    ok: bool = Field(..., description="true 表示全部窗口与有效点位重算结果一致")
+    checked_windows: int
+    mismatches: list[CandleMismatch]
 
 
 class ErrorBody(BaseModel):

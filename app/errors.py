@@ -38,6 +38,13 @@ class BatchConflictError(DomainError):
     http_status = 409
 
 
+class CorrectionConflictError(DomainError):
+    """相同 correction_id 的元数据/负载/分片内容与首次提交不一致。"""
+
+    error_code = "correction_conflict"
+    http_status = 409
+
+
 class NotFoundError(DomainError):
     error_code = "not_found"
     http_status = 404
